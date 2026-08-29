@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="pt-PT">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0d6f68" />
+    <title>Património — Gestor financeiro</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar" id="sidebar">
+        <div class="brand">
+          <span class="brand-mark">💰</span>
+          <span>Património<span class="brand-dot">.</span></span>
+          <button class="close-menu" id="close-menu">✕</button>
+        </div>
+
+        <div class="workspace">
+          <div class="avatar">DG</div>
+          <div><strong>O meu património</strong><small>Conta pessoal (dados locais)</small></div>
+        </div>
+
+        <nav>
+          <p class="nav-label">Aplicação</p>
+          <button class="nav-item" data-page="Dashboard">📊 <span>Dashboard</span></button>
+          <button class="nav-item" data-page="Contas">👛 <span>Contas</span></button>
+          <button class="nav-item" data-page="Transações">💳 <span>Transações</span></button>
+          <button class="nav-item" data-page="Relatórios">📈 <span>Relatórios</span></button>
+
+          <p class="nav-label">Investimentos</p>
+          <button class="nav-item" data-page="Portfólio">📉 <span>Portfólio</span></button>
+          <button class="nav-item" data-page="Importar DEGIRO">⬆️ <span>Importar DEGIRO</span></button>
+
+          <p class="nav-label">Sistema</p>
+          <button class="nav-item" data-page="Definições">⚙️ <span>Definições</span></button>
+        </nav>
+
+        <div class="sidebar-bottom">
+          <div class="upgrade">
+            <strong>Fase atual: local</strong>
+            <p>Os dados ficam guardados só neste navegador (localStorage). A ligação à base de dados Supabase é o próximo passo.</p>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header>
+          <button class="mobile-menu" id="open-menu">☰</button>
+          <div>
+            <p class="eyebrow" id="page-eyebrow">Gestor financeiro local</p>
+            <h1 id="page-title">Bom dia 👋</h1>
+          </div>
+          <div class="header-actions">
+            <button class="primary" id="btn-nova-transacao">＋ Nova transação</button>
+          </div>
+        </header>
+
+        <div id="content"></div>
+      </main>
+
+      <div class="toast" id="toast" style="display:none"></div>
+      <div class="modal-backdrop" id="modal-root"></div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
