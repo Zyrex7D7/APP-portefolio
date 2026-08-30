@@ -73,6 +73,66 @@ Se o teu ficheiro vier de outra fonte com colunas explícitas de
 "Quantidade"/"Preço", o parser também as deteta e usa essas em vez de
 tentar interpretar o texto da descrição.
 
+## Cotações automáticas (Yahoo Finance)
+
+A página **Portfólio** vai buscar a cotação à Yahoo Finance sozinha, sem
+precisares de carregar em nada:
+
+1. Escreve o **ticker da Yahoo Finance** (não é o ISIN) — ex.: SAP SE é
+   `SAP.DE`. Para os teus ETFs, procura pelo ISIN em
+   [finance.yahoo.com](https://finance.yahoo.com) ou
+   [justetf.com](https://www.justetf.com) para confirmares o ticker certo
+   na bolsa onde compraste (normalmente Xetra, sufixo `.DE`).
+2. A partir daí, a app **atualiza a cotação automaticamente de hora a
+   hora**, enquanto a aba do browser estiver aberta, e faz logo uma
+   atualização quando abres a página se os dados já tiverem mais de 1 hora.
+   Junto de cada posição vês há quanto tempo foi a última atualização
+   ("há 12 min", "há 2h"...).
+3. Também podes forçar uma atualização na hora com "Atualizar" (por
+   ativo) ou "Atualizar todas as cotações" (topo da página).
+
+**Porque não uma API "melhor" que a Yahoo?** Comparei as alternativas
+sérias (Twelve Data, Alpha Vantage, Financial Modeling Prep) — todas
+bloqueiam pedidos diretos do browser tal como a Yahoo, porque expor uma
+API key no código de um site é uma prática insegura (fica visível a
+qualquer pessoa que abra o DevTools) — por isso os fornecedores "a sério"
+exigem que os pedidos venham de um servidor. A Yahoo, sendo gratuita e
+sem chave, é na prática a opção mais viável para uma app sem backend. O
+obstáculo real não é a fonte de dados, é a arquitetura "só HTML" — isso
+resolve-se mesmo é ligando ao Supabase (fase seguinte).
+
+**Limitação importante e honesta:** a Yahoo Finance não permite pedidos
+diretos a partir do browser (falta o cabeçalho CORS — foi exatamente por
+isso que tinhas construído a Edge Function antes). Sem servidor próprio,
+a única forma de isto funcionar 100% dentro de um `index.html` estático é
+passar por um proxy CORS público gratuito. Para não depender de um único
+serviço (que pode cair), a app tenta automaticamente **três proxies
+diferentes em sequência** antes de desistir — cada tentativa tem um
+limite de 8 segundos para nunca deixar o botão preso "a carregar".
+
+Outra limitação honesta: a atualização automática só corre **enquanto a
+aba do browser está aberta**. Uma página estática sem servidor não
+consegue atualizar-se sozinha em segundo plano com o browser fechado —
+isso precisa de um cron job num backend (é isso que a Edge Function
+resolveria, na fase do Supabase).
+
+Sempre que a atualização automática falhar (proxy em baixo, ticker
+errado, etc.):
+- se já havia uma cotação anterior, ela é mantida e marcada como
+  "desatualizada", em vez de desaparecer;
+- o campo de **cotação manual** (ao lado do ticker) continua sempre
+  disponível como alternativa garantida, exatamente como antes.
+
+Também não há conversão de câmbio: se o ticker devolver um preço numa
+moeda diferente de EUR, isso fica assinalado junto do preço, mas o valor
+não é convertido automaticamente.
+
+Quando avançarmos para a fase do Supabase, a Edge Function que já tens
+feita (`backend-futuro/edge-function-quotes.ts`) resolve isto de forma
+muito mais fiável (é o teu próprio servidor a falar com a Yahoo, sem
+depender de um proxy de terceiros, e pode correr num cron mesmo com o
+browser fechado).
+
 ## Próximo passo
 Quando quiseres, avançamos para a ligação a sério ao Supabase (autenticação
 + leitura/escrita real + cotações automáticas via a Edge Function). Ver

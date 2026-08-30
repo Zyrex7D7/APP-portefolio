@@ -16,7 +16,7 @@ const parseAmountInput = (raw) => Number(String(raw ?? '').replace(',', '.'));
 const fmtDate = (iso) => new Date(`${iso}T12:00:00`).toLocaleDateString('pt-PT');
 
 function emptyState() {
-  return { accounts: [], cash: [], investments: [], quotes: {} };
+  return { accounts: [], cash: [], investments: [], quotes: {}, tickers: {} };
 }
 
 function loadState() {
@@ -32,6 +32,7 @@ function loadState() {
       parsed.quotes &&
       typeof parsed.quotes === 'object'
     ) {
+      if (!parsed.tickers || typeof parsed.tickers !== 'object') parsed.tickers = {}; // compatibilidade com estados guardados antes desta funcionalidade
       return parsed;
     }
     return emptyState();
@@ -432,6 +433,66 @@ function importDegiroRows(state, rows) {
 }
 
 /* =========================================================================
+   COTAÇÕES AUTOMÁTICAS (Yahoo Finance, via proxy CORS público)
+   O endpoint da Yahoo Finance não envia cabeçalhos CORS, por isso o browser
+   bloqueia o pedido direto (foi por isso que a versão anterior tinha uma
+   Edge Function a fazer de intermediária). Sem servidor próprio, a única
+   forma de isto funcionar 100% no browser é passar por um proxy CORS
+   público e gratuito. Isto é menos fiável do que um servidor teu (o proxy
+   pode ficar em baixo ou ter limites de utilização) — por isso o botão de
+   cotação manual continua sempre disponível como alternativa garantida.
+   ========================================================================= */
+
+// Vários proxies CORS gratuitos, tentados por ordem — se o primeiro falhar ou
+// estiver em baixo, tenta o seguinte automaticamente antes de desistir. Cada
+// tentativa tem um limite de tempo para nunca deixar o botão preso "a carregar".
+const CORS_PROXIES = [
+  (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+  (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+];
+
+async function fetchWithTimeout(url, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function parseYahooChartJson(json) {
+  if (json?.chart?.error) throw new Error(json.chart.error.description || 'Ticker não encontrado');
+  const result = json?.chart?.result?.[0];
+  const closes = result?.indicators?.quote?.[0]?.close?.filter((v) => v !== null && v !== undefined);
+  const price = closes?.length ? closes[closes.length - 1] : result?.meta?.regularMarketPrice;
+  if (typeof price !== 'number') throw new Error('Sem cotação válida na resposta.');
+  return { price, currency: result?.meta?.currency || null };
+}
+
+async function fetchYahooQuote(ticker) {
+  const target = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=1d&interval=1m`;
+  let lastError = new Error('Nenhum serviço de cotações respondeu.');
+  for (const buildProxyUrl of CORS_PROXIES) {
+    try {
+      const res = await fetchWithTimeout(buildProxyUrl(target), 8000);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      const json = JSON.parse(text); // se o proxy devolver HTML/texto em vez de JSON, falha aqui e passa ao próximo proxy
+      return parseYahooChartJson(json);
+    } catch (err) {
+      lastError = err.name === 'AbortError' ? new Error('O serviço demorou demasiado tempo a responder.') : err;
+      // tenta o proxy seguinte
+    }
+  }
+  throw lastError;
+}
+
+
+
+
+/* =========================================================================
    ESTADO DA APLICAÇÃO E ROUTER
    ========================================================================= */
 
@@ -441,6 +502,92 @@ let range = 'Último mês';
 let mobileOpen = false;
 let lastImportResult = null; // { rows, rejected } vindo do parser
 let lastImportSummary = null; // texto amigável sobre o que foi importado
+let quoteFetchErrors = {}; // { [assetKey]: mensagem de erro do último pedido automático, se falhou }
+let autoRefreshTimer = null;
+
+/* =========================================================================
+   ATUALIZAÇÃO AUTOMÁTICA DE COTAÇÕES
+   Enquanto a aba do browser estiver aberta, a app atualiza sozinha as
+   cotações de hora a hora, e faz uma atualização inicial ao abrir se os
+   dados já tiverem mais de 1 hora. Nota honesta: isto só corre enquanto o
+   browser está aberto — uma página estática sem servidor não consegue
+   atualizar-se "em segundo plano" com o browser fechado (isso precisaria
+   de um cron job num backend, que é a fase seguinte do projeto).
+   ========================================================================= */
+
+const AUTO_REFRESH_INTERVAL_MS = 60 * 60 * 1000; // 1 hora
+
+async function refreshAllQuotesQuietly() {
+  const pending = Object.entries(state.tickers).filter(([, t]) => t);
+  if (!pending.length) return;
+  for (const [key, ticker] of pending) {
+    try {
+      const { price, currency } = await fetchYahooQuote(ticker);
+      delete quoteFetchErrors[key];
+      state = { ...state, quotes: { ...state.quotes, [key]: { price, currency, updatedAt: new Date().toISOString(), manual: false, stale: false } } };
+      saveState(state);
+    } catch (err) {
+      quoteFetchErrors[key] = `Não foi possível atualizar automaticamente (${err.message || 'erro desconhecido'}).`;
+      if (state.quotes[key]) {
+        state = { ...state, quotes: { ...state.quotes, [key]: { ...state.quotes[key], stale: true } } };
+        saveState(state);
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1500)); // pausa entre pedidos, para não sobrecarregar os proxies gratuitos
+  }
+  if (page === 'Portfólio') renderAll();
+}
+
+function startAutoRefresh() {
+  if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+  autoRefreshTimer = setInterval(refreshAllQuotesQuietly, AUTO_REFRESH_INTERVAL_MS);
+  // atualização inicial se alguma cotação tiver mais de 1 hora (ou nunca foi buscada), sem bloquear o arranque da app
+  setTimeout(() => {
+    const needsRefresh = Object.keys(state.tickers).some((key) => {
+      const q = state.quotes[key];
+      return !q || !q.updatedAt || Date.now() - new Date(q.updatedAt).getTime() > AUTO_REFRESH_INTERVAL_MS;
+    });
+    if (needsRefresh) refreshAllQuotesQuietly();
+  }, 1500);
+}
+
+function timeAgo(iso) {
+  if (!iso) return null;
+  const diffMs = Date.now() - new Date(iso).getTime();
+  const mins = Math.round(diffMs / 60000);
+  if (mins < 1) return 'agora mesmo';
+  if (mins < 60) return `há ${mins} min`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `há ${hours}h`;
+  const days = Math.round(hours / 24);
+  return `há ${days}d`;
+}
+
+async function refreshSingleQuote(key, ticker, btn) {
+  const originalText = btn ? btn.textContent : null;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '↻…';
+  }
+  try {
+    const { price, currency } = await fetchYahooQuote(ticker);
+    delete quoteFetchErrors[key];
+    state = { ...state, quotes: { ...state.quotes, [key]: { price, currency, updatedAt: new Date().toISOString(), manual: false, stale: false } } };
+    saveState(state);
+  } catch (err) {
+    quoteFetchErrors[key] = `Não foi possível atualizar automaticamente (${err.message || 'erro desconhecido'}). ${state.quotes[key] ? 'A manter a última cotação conhecida.' : 'Insere a cotação manualmente.'}`;
+    if (state.quotes[key]) {
+      state = { ...state, quotes: { ...state.quotes, [key]: { ...state.quotes[key], stale: true } } };
+      saveState(state);
+    }
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
+  }
+  if (btn) renderAll();
+}
 
 function update(nextState, toastMsg) {
   state = nextState;
@@ -490,7 +637,7 @@ function renderAll() {
   else if (page === 'Contas') content.innerHTML = renderAccounts();
   else if (page === 'Transações') content.innerHTML = renderTransactions();
   else if (page === 'Relatórios') content.innerHTML = renderReports();
-  else if (page === 'Portfólio') content.innerHTML = renderPortfolio(portfolio);
+  else if (page === 'Portfólio') content.innerHTML = renderPortfolio(portfolio.map((p) => ({ ...p, fetchError: quoteFetchErrors[p.assetKey] })));
   else if (page === 'Importar DEGIRO') content.innerHTML = renderImport();
   else content.innerHTML = renderSettings();
 
@@ -685,7 +832,8 @@ function renderPortfolio(portfolio) {
   return `
     <section class="card page-card">
       <div class="section-heading">
-        <div><h2>Portfólio</h2><p>Preço médio ponderado e P&amp;L por ativo. Atualiza a cotação manualmente por agora — a ligação a cotações em tempo real fica para a fase do Supabase.</p></div>
+        <div><h2>Portfólio</h2><p>Define o ticker da Yahoo Finance para cada posição (ex.: SAP.DE) — a partir daí a app atualiza a cotação sozinha de hora a hora, enquanto tiveres esta aba aberta. Se preferires, também podes atualizar ou corrigir na hora.</p></div>
+        <button type="button" class="link-button" id="btn-refresh-all">↻ Atualizar todas as cotações</button>
       </div>
       ${
         portfolio.length
@@ -696,11 +844,17 @@ function renderPortfolio(portfolio) {
           <span class="bank-icon">↗</span>
           <span class="account-name">
             <strong>${escapeHtml(p.assetName)}</strong>
-            <small>${p.quantity} unid. · custo médio ${money(p.averageCost)} · cotação ${money(p.price)} · P&amp;L realizado ${money(p.realizedPnl)}</small>
+            <small>${p.quantity} unid. · custo médio ${money(p.averageCost)} · cotação ${money(p.price)}${p.quote?.currency && p.quote.currency !== 'EUR' ? ` <span class="stale">moeda: ${escapeHtml(p.quote.currency)}</span>` : ''}${p.quote?.stale ? ' <span class="stale">desatualizada</span>' : ''}${p.quote?.updatedAt ? ` <span class="muted">(${timeAgo(p.quote.updatedAt)})</span>` : ''} · P&amp;L realizado ${money(p.realizedPnl)}</small>
             ${p.error ? `<span class="error-tag">${escapeHtml(p.error)}</span>` : ''}
+            ${p.fetchError ? `<span class="error-tag">${escapeHtml(p.fetchError)}</span>` : ''}
           </span>
           <strong class="${p.unrealizedPnl >= 0 ? 'positive' : 'negative'}">${money(p.unrealizedPnl)}</strong>
-          <input type="text" class="quote-input" placeholder="cotação" data-quote-input="${escapeAttr(p.assetKey)}" value="${p.quote ? p.quote.price : ''}" />
+        </div>
+        <div class="account-row" style="margin-top:-8px 0 17px">
+          <span style="width:28px;flex-shrink:0"></span>
+          <input type="text" class="quote-input" style="width:110px!important" placeholder="ticker Yahoo (ex. SAP.DE)" data-ticker-input="${escapeAttr(p.assetKey)}" value="${escapeAttr(state.tickers[p.assetKey] || '')}" />
+          <button type="button" class="link-button" data-refresh-quote="${escapeAttr(p.assetKey)}">↻ Atualizar</button>
+          <input type="text" class="quote-input" placeholder="cotação manual" data-quote-input="${escapeAttr(p.assetKey)}" value="${p.quote ? p.quote.price : ''}" />
           <button type="button" class="link-button" data-save-quote="${escapeAttr(p.assetKey)}">Guardar</button>
         </div>`
               )
@@ -854,6 +1008,48 @@ function attachPageHandlers(portfolio) {
     })
   );
 
+  document.querySelectorAll('[data-ticker-input]').forEach((input) =>
+    input.addEventListener('change', () => {
+      const key = input.dataset.tickerInput;
+      const ticker = input.value.trim().toUpperCase();
+      const tickers = { ...state.tickers };
+      if (ticker) tickers[key] = ticker;
+      else delete tickers[key];
+      state = { ...state, tickers };
+      saveState(state);
+    })
+  );
+
+  document.querySelectorAll('[data-refresh-quote]').forEach((btn) =>
+    btn.addEventListener('click', async () => {
+      const key = btn.dataset.refreshQuote;
+      const tickerInput = document.querySelector(`[data-ticker-input="${cssEscape(key)}"]`);
+      const ticker = tickerInput?.value.trim().toUpperCase();
+      if (!ticker) {
+        alert('Escreve primeiro o ticker da Yahoo Finance para este ativo (ex.: SAP.DE). Procura o teu ativo em finance.yahoo.com para confirmar o símbolo certo.');
+        return;
+      }
+      await refreshSingleQuote(key, ticker, btn);
+    })
+  );
+
+  document.getElementById('btn-refresh-all')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const pending = Object.entries(state.tickers).filter(([, t]) => t);
+    if (!pending.length) {
+      alert('Ainda não definiste nenhum ticker. Escreve o ticker da Yahoo Finance junto de cada ativo primeiro.');
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = '↻ A atualizar…';
+    for (const [key, ticker] of pending) {
+      await refreshSingleQuote(key, ticker, null);
+    }
+    btn.disabled = false;
+    btn.textContent = '↻ Atualizar todas as cotações';
+    renderAll();
+  });
+
   document.getElementById('input-degiro-file')?.addEventListener('change', async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -984,3 +1180,4 @@ function cssEscape(str) {
 
 document.querySelectorAll('.nav-item').forEach((btn) => btn.addEventListener('click', () => goTo(btn.dataset.page)));
 renderAll();
+startAutoRefresh();
