@@ -136,7 +136,7 @@ function reportStart(range, now = new Date()) {
 function groupExpensesByCategory(cash, range, now = new Date()) {
   const start = reportStart(range, now);
   return cash
-    .filter((t) => t.type === 'expense' && new Date(`${t.date}T12:00:00`) >= start)
+    .filter((t) => t.type === 'expense' && t.category !== 'Ajuste interno DEGIRO' && new Date(`${t.date}T12:00:00`) >= start)
     .reduce((out, t) => {
       out[t.category] = (out[t.category] || 0) + Math.abs(t.amount);
       return out;
@@ -216,23 +216,61 @@ function splitCsvLine(line, separator) {
   return cells;
 }
 
+// O ficheiro real exportado pela DEGIRO ("Conta > Exportar movimentos") tem estas colunas:
+// Data, Hora, Data Valor, Produto, ISIN, Descrição, T., Mudança, <moeda|valor>, Saldo, <moeda|valor>, ID da Ordem
+// "Mudança" e "Saldo" ocupam DUAS colunas cada (moeda na coluna com o nome, valor na coluna seguinte, sem cabeçalho).
+// Não há colunas de Quantidade/Preço — para compras/vendas, essa informação vem embutida na Descrição, ex.:
+// "Compra 3 SAP SE@147,54 EUR (DE0007164600)". O parser também aceita variantes com colunas explícitas de
+// Quantidade/Preço, caso existam (outros formatos de exportação).
+function classifyDegiroRow(description) {
+  const norm = normalizeHeader(description);
+  if (/^compra\b/.test(norm)) return { operation: 'buy', category: 'Compra' };
+  if (/^venda\b/.test(norm)) return { operation: 'sell', category: 'Venda' };
+  if (/^dividendo/.test(norm)) return { operation: 'dividend', category: 'Dividendos' };
+  if (/imposto/.test(norm)) return { operation: 'tax', category: 'Impostos' };
+  if (/comiss|taxa de terceiros|corretagem|custo de conectividade/.test(norm)) return { operation: 'fee', category: 'Comissões' };
+  // Movimentos internos da DEGIRO entre a "Conta Caixa" e o fundo de curto prazo (Cash Sweep) — cancelam-se
+  // aos pares e não representam dinheiro a entrar/sair de verdade, por isso ficam marcados como internos
+  // (excluídos do relatório de despesas, mas continuam a contar para o saldo da conta).
+  if (/conta caixa/.test(norm)) return { operation: 'cash', category: 'Ajuste interno DEGIRO', internal: true };
+  if (/cash sweep transfer/.test(norm)) return { operation: 'cash', category: 'Ajuste interno DEGIRO', internal: true };
+  if (/^flatex deposit/.test(norm)) return { operation: 'cash', category: 'Depósito' };
+  if (/interest income|juro/.test(norm)) return { operation: 'cash', category: 'Juros' };
+  return { operation: 'cash', category: 'DEGIRO' };
+}
+
+// Extrai quantidade/preço de descrições como "Compra 3 SAP SE@147,54 EUR (DE0007164600)".
+function extractQuantityPrice(description) {
+  const m = description.match(/^(?:Compra|Venda)\s+([\d.,]+)\s+.+@\s*([\d.,]+)\s*[A-Za-z]{2,4}/i);
+  if (!m) return null;
+  const quantity = parseNumber(m[1]);
+  const price = parseNumber(m[2]);
+  if (quantity === null || quantity === undefined || price === null || price === undefined) return null;
+  return { quantity, price };
+}
+
 function parseDegiroCsv(csv) {
   const lines = csv.replace(/^\uFEFF/, '').split(/\r?\n/).filter((x) => x.trim());
   if (!lines.length) return { rows: [], rejected: [{ line: 1, reason: 'Ficheiro vazio', raw: '' }] };
 
   const separator = lines[0].includes(';') ? ';' : ',';
   const headers = splitCsvLine(lines[0], separator).map(normalizeHeader);
-  const findCol = (names) => headers.findIndex((h) => names.some((n) => h === normalizeHeader(n) || h.includes(normalizeHeader(n))));
+  const findCol = (names) => headers.findIndex((h) => names.some((n) => h === normalizeHeader(n)));
+  const findColLoose = (names) => headers.findIndex((h) => h && names.some((n) => h.includes(normalizeHeader(n))));
 
   const dCol = findCol(['data', 'date']);
   const pCol = findCol(['produto', 'product']);
   const iCol = findCol(['isin']);
   const descCol = findCol(['descricao', 'mutacao', 'description', 'mutation']);
-  const qCol = findCol(['quantidade', 'quantity']);
-  const prCol = findCol(['preco', 'price']);
-  const amCol = findCol(['mudanca', 'mudança', 'valor', 'amount', 'total']);
+  // formato "clássico" com colunas explícitas de quantidade/preço, caso existam nalguma variante do export
+  const qColExplicit = findColLoose(['quantidade', 'quantity']);
+  const prColExplicit = findColLoose(['preco', 'price']);
+  // formato real da DEGIRO: "Mudança" é o cabeçalho da coluna de moeda; o valor está na coluna seguinte
+  const mudCol = findColLoose(['mudanca', 'mudança', 'change']);
+  const amountColExplicit = findColLoose(['valor', 'amount', 'total']);
 
   if (dCol < 0) return { rows: [], rejected: [{ line: 1, reason: 'Coluna "Data" não encontrada no ficheiro', raw: lines[0] }] };
+  if (descCol < 0) return { rows: [], rejected: [{ line: 1, reason: 'Coluna "Descrição" não encontrada no ficheiro', raw: lines[0] }] };
 
   const rows = [];
   const rejected = [];
@@ -240,53 +278,89 @@ function parseDegiroCsv(csv) {
   for (let n = 1; n < lines.length; n++) {
     const cells = splitCsvLine(lines[n], separator);
     const tradedOn = parseDMYDate(cells[dCol]);
-    const product = cells[pCol]?.trim();
+    const product = pCol >= 0 ? cells[pCol]?.trim() : '';
+    const isin = iCol >= 0 ? cells[iCol]?.trim() : '';
     const description = cells[descCol]?.trim();
 
     if (!tradedOn) {
       rejected.push({ line: n + 1, reason: 'Data inválida ou ausente', raw: lines[n] });
       continue;
     }
-    if (!product && !description) {
-      rejected.push({ line: n + 1, reason: 'Produto e descrição ausentes', raw: lines[n] });
+    if (!description) {
+      rejected.push({ line: n + 1, reason: 'Descrição ausente', raw: lines[n] });
       continue;
     }
 
-    const resolvedProduct = product || 'Movimento de conta';
-    const text = `${description ?? ''} ${resolvedProduct}`.toLowerCase();
-    const operation = /dividend|dividendo/.test(text)
-      ? 'dividend'
-      : /fee|comiss|taxa/.test(text)
-      ? 'fee'
-      : /tax|imposto/.test(text)
-      ? 'tax'
-      : /sell|venda|vend/.test(text)
-      ? 'sell'
-      : /buy|compra|compr/.test(text)
-      ? 'buy'
-      : 'cash';
+    const { operation, category, internal } = classifyDegiroRow(description);
 
-    const quantity = qCol >= 0 ? parseNumber(cells[qCol]) : undefined;
-    const price = prCol >= 0 ? parseNumber(cells[prCol]) : undefined;
-    const amount = amCol >= 0 ? parseNumber(cells[amCol]) : undefined;
-
-    // null (e não undefined) significa que o campo estava preenchido mas era ilegível — isso sim é um erro.
-    if (quantity === null || price === null || amount === null) {
-      rejected.push({ line: n + 1, reason: 'Valor numérico inválido (quantidade/preço/valor)', raw: lines[n] });
+    // valor da transação: tenta, por ordem, a coluna "Mudança" (formato real), depois uma coluna "Valor"
+    // explícita, e por fim o valor embutido no texto (linhas de ajuste interno "Conta Caixa").
+    let amount;
+    if (mudCol >= 0 && cells[mudCol + 1] !== undefined && cells[mudCol + 1].trim()) {
+      amount = parseNumber(cells[mudCol + 1]);
+    } else if (amountColExplicit >= 0 && cells[amountColExplicit] && cells[amountColExplicit].trim()) {
+      amount = parseNumber(cells[amountColExplicit]);
+    }
+    if (amount === undefined || amount === null) {
+      const embedded = description.match(/([\d.,]+)\s*(?:EUR|USD|GBP)\s*$/i);
+      if (embedded) {
+        const n2 = parseNumber(embedded[1]);
+        if (n2 !== null && n2 !== undefined) {
+          amount = /^levantamento/.test(normalizeHeader(description)) ? -Math.abs(n2) : Math.abs(n2);
+        }
+      }
+    }
+    if (amount === null) {
+      rejected.push({ line: n + 1, reason: 'Valor da transação inválido', raw: lines[n] });
       continue;
     }
+    if (amount === undefined) {
+      rejected.push({ line: n + 1, reason: 'Não foi possível determinar o valor desta linha', raw: lines[n] });
+      continue;
+    }
+
+    let quantity = 0;
+    let price = 0;
+    if (qColExplicit >= 0 || prColExplicit >= 0) {
+      const qv = qColExplicit >= 0 ? parseNumber(cells[qColExplicit]) : undefined;
+      const pv = prColExplicit >= 0 ? parseNumber(cells[prColExplicit]) : undefined;
+      if (qv === null || pv === null) {
+        rejected.push({ line: n + 1, reason: 'Quantidade/preço inválidos', raw: lines[n] });
+        continue;
+      }
+      quantity = qv ?? 0;
+      price = pv ?? 0;
+    } else if (operation === 'buy' || operation === 'sell') {
+      const extracted = extractQuantityPrice(description);
+      if (extracted) {
+        quantity = extracted.quantity;
+        price = extracted.price;
+      } else if (Math.abs(amount) > 0) {
+        // não conseguimos ler "3 SAP SE@147,54 EUR" — regista pelo menos o valor em dinheiro,
+        // com quantidade 1 e preço = valor, para não perder o movimento; fica sinalizado.
+        quantity = 1;
+        price = Math.abs(amount);
+        rejected.push({ line: n + 1, reason: 'Compra/venda registada, mas não foi possível ler a quantidade/preço exatos na descrição', raw: lines[n] });
+      }
+    }
+
+    const isAssetRow = Boolean(isin) || (product && !internal && category !== 'DEGIRO' && category !== 'Depósito' && category !== 'Juros');
 
     const row = {
       tradedOn,
-      product: resolvedProduct,
-      isin: cells[iCol]?.trim() || undefined,
+      product: product || 'Movimento de conta',
+      isin: isin || undefined,
       operation,
-      quantity: quantity ?? 0,
-      price: price,
-      amount: amount,
-      description: description || operation,
+      quantity,
+      price,
+      amount,
+      description,
+      category,
+      internal: Boolean(internal),
+      isAssetRow: Boolean(isAssetRow),
     };
-    rows.push({ ...row, externalHash: hashRow(JSON.stringify(row)) });
+    row.externalHash = hashRow(JSON.stringify(row));
+    rows.push(row);
   }
 
   return { rows, rejected };
@@ -324,10 +398,9 @@ function importDegiroRows(state, rows) {
       skippedDuplicates++;
       continue;
     }
-    const isAssetMovement = Boolean(row.isin) || (row.product && row.product !== 'Movimento de conta');
     const isTradeOp = ['buy', 'sell', 'dividend', 'fee', 'tax'].includes(row.operation);
 
-    if (isAssetMovement && isTradeOp) {
+    if (row.isAssetRow && isTradeOp) {
       investments.push({
         id: row.externalHash,
         accountId: account.id,
@@ -340,14 +413,14 @@ function importDegiroRows(state, rows) {
         amount: Math.abs(row.amount || 0),
       });
       imported++;
-    } else if (row.amount !== undefined) {
+    } else {
       cash.push({
         id: row.externalHash,
         accountId: account.id,
         type: row.amount >= 0 ? 'income' : 'expense',
         amount: Math.abs(row.amount),
         date: row.tradedOn,
-        category: 'DEGIRO',
+        category: row.category || 'DEGIRO',
         description: row.description || row.product,
       });
       imported++;
@@ -664,10 +737,20 @@ function renderImport() {
         </div>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>DATA</th><th>PRODUTO</th><th>OPERAÇÃO</th><th>QUANTIDADE</th><th>PREÇO</th></tr></thead>
+            <thead><tr><th>DATA</th><th>PRODUTO</th><th>OPERAÇÃO</th><th>CATEGORIA</th><th>QUANTIDADE</th><th>PREÇO</th><th class="align-right">VALOR</th></tr></thead>
             <tbody>
               ${result.rows
-                .map((r) => `<tr><td>${r.tradedOn}</td><td>${escapeHtml(r.product)}</td><td>${r.operation}</td><td>${r.quantity}</td><td>${r.price ?? '—'}</td></tr>`)
+                .map(
+                  (r) => `<tr>
+                    <td>${r.tradedOn}</td>
+                    <td>${escapeHtml(r.product)}</td>
+                    <td>${r.operation}</td>
+                    <td>${escapeHtml(r.category)}${r.internal ? ' <small class="muted">(interno)</small>' : ''}</td>
+                    <td>${r.operation === 'buy' || r.operation === 'sell' ? r.quantity : '—'}</td>
+                    <td>${r.operation === 'buy' || r.operation === 'sell' ? money(r.price) : '—'}</td>
+                    <td class="align-right ${r.amount >= 0 ? 'positive' : 'negative'}">${money(r.amount)}</td>
+                  </tr>`
+                )
                 .join('')}
             </tbody>
           </table>

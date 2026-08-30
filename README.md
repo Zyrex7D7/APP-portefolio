@@ -48,6 +48,31 @@ build, não há `npm install`, não há servidor. Os dados ficam guardados no
    introduzires a cotação manualmente por ativo; isto é temporário até
    ligarmos a Edge Function que já tens feita.
 
+## Formato real do ficheiro da DEGIRO
+Testei o parser com um `Account.csv` real exportado da DEGIRO ("Conta →
+Exportar movimentos"), e o formato é diferente do que se costuma encontrar
+em templates genéricos por aí:
+
+- **Não há colunas separadas de Quantidade/Preço.** Para compras/vendas,
+  essa informação vem embutida no texto da Descrição, ex.: `Compra 3 SAP
+  SE@147,54 EUR (DE0007164600)`. O parser extrai a quantidade e o preço
+  diretamente desse texto.
+- **"Mudança" e "Saldo" ocupam duas colunas cada** (uma para a moeda, a
+  seguinte — sem cabeçalho — para o valor). O parser já sabe ler isto.
+- **Há linhas de "ajuste interno"** (`Degiro Cash Sweep Transfer` +
+  `Depósitos/Levantamentos da sua Conta Caixa...`) que representam a
+  DEGIRO a mover dinheiro entre a conta de trading e um fundo de curto
+  prazo — cancelam-se aos pares e não são despesa a sério. Continuam a
+  contar para o saldo da conta (para bater certo com o extrato), mas ficam
+  marcadas como `Ajuste interno DEGIRO` e são excluídas do relatório de
+  "despesas por categoria" para não distorcerem os teus gastos reais.
+- Validado: com um ficheiro real, o saldo da conta calculado pela app bate
+  ao cêntimo com o saldo mostrado pela própria DEGIRO.
+
+Se o teu ficheiro vier de outra fonte com colunas explícitas de
+"Quantidade"/"Preço", o parser também as deteta e usa essas em vez de
+tentar interpretar o texto da descrição.
+
 ## Próximo passo
 Quando quiseres, avançamos para a ligação a sério ao Supabase (autenticação
 + leitura/escrita real + cotações automáticas via a Edge Function). Ver
